@@ -1,0 +1,20 @@
+{
+  "name": "Cloud Linux Desktop",
+  "image": "mcr.microsoft.com/devcontainers/universal:linux",
+  "remoteUser": "codespace",
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": true,
+      "upgradePackages": true
+    }
+  },
+  "postCreateCommand": "bash .devcontainer/bootstrap.sh",
+  "postStartCommand": "bash .devcontainer/start.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "GitHub.vscode-pull-request-github"
+      ]
+    }
+  }
+}
