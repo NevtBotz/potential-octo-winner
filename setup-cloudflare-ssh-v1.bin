@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# GitHub Codespaces + Cloudflare Tunnel SSH-only installer.
+# No XFCE, xRDP, VNC, or desktop packages are installed.
+
+if [[ "${EUID}" -eq 0 ]]; then
+  echo "Run this installer as the Codespace user, not root."
+  exit 1
+fi
+
+if ! command -v apt-get >/dev/null 2>&1; then
+  echo "This installer requires a Debian/Ubuntu based GitHub Codespace image."
+  exit 1
+fi
+
+# Codespaces normally provides passwordless sudo. Fail early instead of
+# asking for a Codespace password that the user may not have.
+if ! sudo -n true 2>/dev/null; then
+  echo
+  echo "ERROR: passwordless sudo is not available for the Codespace user."
+  echo "Run: sudo -n true"
+  echo "This installer will not ask for or change your Codespace password."
+  exit 1
+fi
+
+CLOUD_DIR="$HOME/.cloud-ssh"
+mkdir -p "$CLOUD_DIR"
+chmod 700 "$CLOUD_DIR"
+
+# Keep sudo usable during long apt operations.
+sudo -n true
+(
+  while sleep 45; do
+    sudo -n true 2>/dev/null || exit 0
+  done
+) &
+SUDO_KEEPALIVE_PID=$!
+cleanup() {
+  kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+echo
+echo "============================================================"
+echo " Cloudflare SSH-only for GitHub Codespaces"
+echo " No RDP / XFCE / VNC"
+echo "============================================================"
+echo
+
+read -r -p "SSH hostname (example: ssh.example.com): " SSH_HOST
+if [[ -z "$SSH_HOST" ]]; then
+  echo "SSH hostname is required."
+  exit 1
+fi
+
+read -r -p "SSH username [codespace]: " SSH_USER
+SSH_USER="${SSH_USER:-codespace}"
+
+if ! id "$SSH_USER" >/dev/null 2>&1; then
+  echo "ERROR: user '$SSH_USER' does not exist."
+  echo "Use the existing Codespace user, normally: codespace"
+  exit 1
+fi
+
+read -r -s -p "Set SSH password for $SSH_USER (leave empty to keep current password): " SSH_PASS
+printf '\n'
+
+if [[ -n "$SSH_PASS" ]]; then
+  printf '%s:%s\n' "$SSH_USER" "$SSH_PASS" | sudo chpasswd
+fi
+
+# Detect the Codespace user's home directory without relying on $HOME.
+SSH_HOME="$(getent passwd "$SSH_USER" | cut -d: -f6)"
+if [[ -z "$SSH_HOME" ]]; then
+  echo "ERROR: Could not determine home directory for '$SSH_USER'."
+  exit 1
+fi
+
+# Prevent accidental localhost-only/remote binding confusion. SSH remains
+# bound to localhost because Cloudflare Tunnel is the public entry point.
+SSHD_CONFIG="/etc/ssh/sshd_config"
+
+
+echo
+echo "[1/5] Installing OpenSSH server and dependencies..."
+sudo apt-get update
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  openssh-server \
+  curl \
+  ca-certificates \
+  gnupg
+
+# Refresh sudo after potentially long package installation.
+sudo -n true
+
+echo
+echo "[2/5] Configuring OpenSSH..."
+sudo mkdir -p /run/sshd
+sudo ssh-keygen -A >/dev/null 2>&1 || true
+
+# Remove/replace ListenAddress directives so sshd only listens locally.
+if sudo grep -qE '^[#[:space:]]*ListenAddress[[:space:]]+' "$SSHD_CONFIG"; then
+  sudo sed -i -E 's/^[#[:space:]]*ListenAddress[[:space:]].*/ListenAddress 127.0.0.1/' "$SSHD_CONFIG"
+else
+  echo 'ListenAddress 127.0.0.1' | sudo tee -a "$SSHD_CONFIG" >/dev/null
+fi
+
+# Enable password authentication only if the user supplied a password.
+# Otherwise keep the image's existing authentication policy.
+if [[ -n "$SSH_PASS" ]]; then
+  if sudo grep -qE '^[#[:space:]]*PasswordAuthentication[[:space:]]+' "$SSHD_CONFIG"; then
+    sudo sed -i -E 's/^[#[:space:]]*PasswordAuthentication[[:space:]].*/PasswordAuthentication yes/' "$SSHD_CONFIG"
+  else
+    echo 'PasswordAuthentication yes' | sudo tee -a "$SSHD_CONFIG" >/dev/null
+  fi
+fi
+
+# Basic safety settings. Do not allow root SSH login.
+if sudo grep -qE '^[#[:space:]]*PermitRootLogin[[:space:]]+' "$SSHD_CONFIG"; then
+  sudo sed -i -E 's/^[#[:space:]]*PermitRootLogin[[:space:]].*/PermitRootLogin no/' "$SSHD_CONFIG"
+else
+  echo 'PermitRootLogin no' | sudo tee -a "$SSHD_CONFIG" >/dev/null
+fi
+
+sudo /usr/sbin/sshd -t
+
+# Start sshd for this Codespace. systemd may not be available.
+if pgrep -x sshd >/dev/null 2>&1; then
+  echo "sshd is already running."
+else
+  sudo /usr/sbin/sshd
+fi
+
+
+echo
+echo "[3/5] Installing cloudflared..."
+if ! command -v cloudflared >/dev/null 2>&1; then
+  curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
+    | sudo gpg --dearmor -o /usr/share/keyrings/cloudflare-main.gpg
+
+  echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' \
+    | sudo tee /etc/apt/sources.list.d/cloudflared.list >/dev/null
+
+  sudo apt-get update
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y cloudflared
+fi
+
+cloudflared --version || true
+
+
+echo
+echo "[4/5] Writing SSH-only runtime..."
+cat > "$CLOUD_DIR/config.env" <<EOF2
+SSH_HOST=$(printf '%q' "$SSH_HOST")
+SSH_USER=$(printf '%q' "$SSH_USER")
+EOF2
+chmod 600 "$CLOUD_DIR/config.env"
+
+cat > "$CLOUD_DIR/start-ssh.sh" <<'EOF2'
+#!/usr/bin/env bash
+set -euo pipefail
+
+CLOUD_DIR="$HOME/.cloud-ssh"
+CONFIG="$CLOUD_DIR/config.env"
+LOGFILE="$CLOUD_DIR/cloudflared.log"
+PIDFILE="$CLOUD_DIR/cloudflared.pid"
+
+[[ -f "$CONFIG" ]] && source "$CONFIG"
+: "${SSH_HOST:?SSH_HOST missing}"
+: "${SSH_USER:?SSH_USER missing}"
+: "${CF_TUNNEL_TOKEN:?CF_TUNNEL_TOKEN environment secret is required}"
+
+# Make sure the local SSH daemon exists. It only listens on 127.0.0.1:22.
+if ! pgrep -x sshd >/dev/null 2>&1; then
+  sudo mkdir -p /run/sshd
+  sudo /usr/sbin/sshd
+fi
+
+# Avoid starting duplicate connectors.
+if ! pgrep -af 'cloudflared.*tunnel.*--token' >/dev/null 2>&1; then
+  nohup cloudflared tunnel --no-autoupdate run --token "$CF_TUNNEL_TOKEN" \
+    >>"$LOGFILE" 2>&1 &
+  echo $! > "$PIDFILE"
+fi
+
+echo "============================================================"
+echo " Cloudflare SSH-only runtime is running"
+echo " SSH host : $SSH_HOST"
+echo " SSH user : $SSH_USER"
+echo " Local    : 127.0.0.1:22"
+echo "============================================================"
+echo
+echo "Cloudflare route required:"
+echo "  $SSH_HOST -> ssh://localhost:22"
+echo
+echo "No RDP/xRDP/desktop components are used."
+EOF2
+chmod +x "$CLOUD_DIR/start-ssh.sh"
+
+cat > "$CLOUD_DIR/README.txt" <<EOF2
+SSH-only Codespace setup
+
+SSH hostname: $SSH_HOST
+SSH username: $SSH_USER
+
+Cloudflare Tunnel service route:
+  $SSH_HOST -> ssh://localhost:22
+
+Codespaces secret required:
+  CF_TUNNEL_TOKEN
+
+Runtime:
+  $CLOUD_DIR/start-ssh.sh
+
+Cloudflare log:
+  $CLOUD_DIR/cloudflared.log
+EOF2
+chmod 600 "$CLOUD_DIR/README.txt"
+
+
+echo
+echo "[5/5] Validating installation..."
+sudo /usr/sbin/sshd -t
+if ss -lnt 2>/dev/null | grep -q '127.0.0.1:22'; then
+  echo "OK: sshd is listening on 127.0.0.1:22"
+else
+  echo "WARNING: sshd is not currently visible on 127.0.0.1:22"
+fi
+
+if command -v cloudflared >/dev/null 2>&1; then
+  echo "OK: cloudflared installed"
+fi
+
+echo
+echo "============================================================"
+echo " SSH-only installation complete"
+echo "============================================================"
+echo
+echo "Next steps:"
+echo "1. Add the Codespaces secret: CF_TUNNEL_TOKEN"
+echo "2. Configure Cloudflare Tunnel:"
+echo "     $SSH_HOST -> ssh://localhost:22"
+echo "3. Start the connector:"
+echo "     $CLOUD_DIR/start-ssh.sh"
+echo
+echo "No RDP, XFCE, xRDP, VNC, or desktop user was installed."
+echo
+echo "For Cloudflare Access SSH, use cloudflared access ssh from the client."
+echo
