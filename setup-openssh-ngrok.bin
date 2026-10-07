@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# YokuHost/Codespaces: OpenSSH + ngrok TCP setup
+# Token is read from environment variable NGROK_AUTHTOKEN.
+# Do NOT put the token directly in this script.
+
+SSH_PORT="${SSH_PORT:-2222}"
+NGROK_BIN="${HOME}/.local/bin/ngrok"
+
+echo "== OpenSSH + ngrok setup =="
+echo "[1/6] Checking sudo..."
+if ! sudo -n true 2>/dev/null; then
+  echo "sudo passwordless access is required."
+  echo "Run 'sudo -v' once, then run this installer again."
+  exit 1
+fi
+
+echo "[2/6] Installing OpenSSH server..."
+sudo apt-get update
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server curl ca-certificates tar
+
+echo "[3/6] Configuring SSH on port ${SSH_PORT}..."
+sudo mkdir -p /run/sshd
+
+# Create a dedicated SSH config fragment.
+sudo tee /etc/ssh/sshd_config.d/99-codespace-ngrok.conf >/dev/null <<EOF
+Port ${SSH_PORT}
+ListenAddress 0.0.0.0
+PasswordAuthentication yes
+PubkeyAuthentication yes
+PermitRootLogin no
+UsePAM yes
+EOF
+
+# Ensure the current Codespace user has a usable password if none exists.
+if ! passwd -S "${USER}" 2>/dev/null | grep -q ' P '; then
+  echo
+  echo "Set an SSH password for user '${USER}'."
+  sudo passwd "${USER}"
+fi
+
+echo "[4/6] Validating SSH configuration..."
+sudo sshd -t
+
+# Codespaces normally doesn't run systemd, so start sshd directly.
+sudo pkill -x sshd 2>/dev/null || true
+sudo /usr/sbin/sshd
+
+echo "[5/6] Installing ngrok..."
+mkdir -p "${HOME}/.local/bin"
+
+if [[ ! -x "${NGROK_BIN}" ]]; then
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' EXIT
+  curl -fsSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz \
+    -o "${tmpdir}/ngrok.tgz"
+  tar -xzf "${tmpdir}/ngrok.tgz" -C "${tmpdir}"
+  install -m 0755 "${tmpdir}/ngrok" "${NGROK_BIN}"
+fi
+
+echo "[6/6] Configuring ngrok token..."
+if [[ -z "${NGROK_AUTHTOKEN:-}" ]]; then
+  echo
+  echo "NGROK_AUTHTOKEN is not set."
+  echo
+  echo "Add it as a GitHub Codespaces secret:"
+  echo "  Name : NGROK_AUTHTOKEN"
+  echo "  Value: <your ngrok authtoken>"
+  echo
+  echo "Then restart/reopen the Codespace and run:"
+  echo "  NGROK_AUTHTOKEN=... ${NGROK_BIN} config add-authtoken ..."
+  echo
+  echo "No token was written to this script."
+else
+  "${NGROK_BIN}" config add-authtoken "${NGROK_AUTHTOKEN}"
+fi
+
+echo
+echo "=== SETUP COMPLETE ==="
+echo "SSH listening:"
+ss -lntp 2>/dev/null | grep ":${SSH_PORT}" || true
+echo
+echo "Start tunnel with:"
+echo "  NGROK_AUTHTOKEN=\$NGROK_AUTHTOKEN ${NGROK_BIN} tcp ${SSH_PORT}"
+echo
+echo "Use the ngrok Forwarding hostname + port in Termius."
+echo "Do not expose NGROK_AUTHTOKEN in chat or logs."
